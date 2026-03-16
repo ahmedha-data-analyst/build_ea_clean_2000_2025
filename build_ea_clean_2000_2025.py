@@ -4,7 +4,7 @@ EA WATER QUALITY DATA PROCESSOR
 ===============================================================================
 Title   : Environment Agency (England) Open Water Quality Archive — Processor
 Version : 2.0.0
-Authors : Ahmed Abdalla & Team (University of Plymouth / HydroStar)
+Authors : Domanique Bridglalsingh, Ahmed Abdalla, Jia Hu, Geyong Minᵃ, Xiaohong Li, and Siwei Zheng
 Licence : CC-BY-4.0  (same licence as the underlying EA data)
 Python  : >= 3.9
 
