@@ -3,7 +3,7 @@
 EA WATER QUALITY DATA PROCESSOR
 ===============================================================================
 Title   : Environment Agency (England) Open Water Quality Archive — Processor
-Version : 2.0.0
+Version : 2.1.0
 Authors : Domanique Bridglalsingh, Ahmed Abdalla, Jia Hu, Geyong Min, Xiaohong Li, and Siwei Zheng
 Licence : CC-BY-4.0  (same licence as the underlying EA data)
 Python  : >= 3.9
@@ -43,11 +43,17 @@ For every yearly CSV the script will:
   • Remove sample types that are not water-related (biota, soil, gas …).
   • Standardise units:
         µg/l  → mg/l   (÷ 1 000)
+        ng/l  → mg/l   (÷ 1 000 000)
+        pg/l  → mg/l   (÷ 1 000 000 000)
         g/l   → mg/l   (× 1 000)
         ppm   → mg/l   (1 : 1 in dilute water)
-        FTU   → NTU    (1 : 1)
+        FTU   → NTU    (1 : 1 — both nephelometric turbidity scales)
         ms/cm → µS/cm  (× 1 000)
         Various µS/cm spellings → uS/cm
+        no/ml  → no/100ml  (× 100)
+        no/ul  → no/100ml  (× 100 000)
+        no/10ul → no/100ml (× 10 000)
+        g/kg   → ppt       (1 : 1 for salinity)
   • Convert British National Grid (Easting / Northing) to WGS-84
     Latitude / Longitude using the pyproj library.
   • Remove known dummy / placeholder coordinates that the EA used for
@@ -81,7 +87,6 @@ def _ensure_dependencies():
     """Install any missing Python packages required by this script."""
     import subprocess, sys, importlib
 
-    # Map:  import-name  →  pip-name  (they differ for a few packages)
     REQUIRED = {
         "pandas":   "pandas",
         "numpy":    "numpy",
@@ -109,7 +114,6 @@ def _ensure_dependencies():
 
 _ensure_dependencies()
 
-
 # ============================================================================
 # IMPORTS
 # ============================================================================
@@ -120,9 +124,12 @@ import numpy as np
 from pyproj import Transformer
 from typing import Dict, Any, Optional, List
 from datetime import datetime
-import warnings, sys, io
+import warnings, sys, io, re
 
-warnings.filterwarnings("ignore", category=FutureWarning)
+# Suppress ALL non-critical warnings so the user sees only our clean log.
+# This prevents pandas regex-group warnings and deprecation notices from
+# cluttering the output in Jupyter notebooks.
+warnings.filterwarnings("ignore")
 
 
 # ============================================================================
@@ -194,6 +201,10 @@ def build_ea_clean_2000_2025(
         "data_quality"  – dict of summary quality metrics
     """
 
+    # Suppress warnings inside the function as well, so that even if the
+    # user resets the global filter, our function stays clean.
+    warnings.filterwarnings("ignore")
+
     # ------------------------------------------------------------------
     # Capture all print output so we can save it as a log file later
     # ------------------------------------------------------------------
@@ -216,7 +227,7 @@ def build_ea_clean_2000_2025(
         raise ValueError(f"mode must be 'full' or 'electrochemistry', got '{mode}'")
 
     log("=" * 70)
-    log("  EA WATER QUALITY DATA PROCESSOR  v2.0")
+    log("  EA WATER QUALITY DATA PROCESSOR  v2.1")
     log("=" * 70)
     log(f"  Mode            : {mode.upper()}")
     log(f"  Years           : {min(years)} – {max(years)}")
@@ -276,10 +287,10 @@ def build_ea_clean_2000_2025(
     }
 
     # Regex pattern for types we always exclude regardless of mode.
-    # These are biological tissue, soil, gas, waste, and other non-water
-    # sample types that occasionally share names with water bodies.
+    # NOTE: We use (?:...) NON-CAPTURING groups to prevent pandas
+    #        from emitting UserWarning about regex capture groups.
     DROP_TYPE_PATTERN = (
-        r"(SEDIMENT|WHOLE ANIMAL|MUSCLE|LIVER|DIGESTIVE GLAND|BIOTA|"
+        r"(?:SEDIMENT|WHOLE ANIMAL|MUSCLE|LIVER|DIGESTIVE GLAND|BIOTA|"
         r"SOIL|ASH|WASTE\b|GAS|PRECIPITATION|CALIBRATION WATER|"
         r"POTABLE WATER|BOREHOLE GAS|ANY WATER\b|ANY NON-AQUEOUS LIQUID|"
         r"UNCODED|ANY AGRICULTURAL|ANY SEWAGE SLUDGE|ANY TIPPED|"
@@ -293,9 +304,6 @@ def build_ea_clean_2000_2025(
     # ==================================================================
     #  CONFIGURATION — ELECTROCHEMISTRY TEST SET
     # ==================================================================
-    # These are the tests relevant to electrochemical sensing research.
-    # Used ONLY when  mode = "electrochemistry".
-    # ------------------------------------------------------------------
 
     ELECTROCHEMISTRY_TESTS = {
         # Dissolved metals
@@ -338,71 +346,53 @@ def build_ea_clean_2000_2025(
     # ==================================================================
     #  CONFIGURATION — NON-QUANTITATIVE UNITS TO DROP
     # ==================================================================
-    # These unit labels indicate non-numeric or coded observations.
-    # Rows with these units are removed because they cannot be analysed
-    # as continuous measurements.
-    # ------------------------------------------------------------------
 
     NON_QUANTITATIVE_UNITS = {
-        "coded",      # categorical indicators  (e.g. "No flow / No sample")
+        "coded",      # categorical indicators (e.g. "No flow / No sample")
         "text",       # free-text descriptions
-        "yes/no",     # binary flags            (e.g. "Photo Taken: Yes/No")
-        "pres/nf",    # present / not found     (biological presence)
+        "yes/no",     # binary flags (e.g. "Photo Taken: Yes/No")
+        "pres/nf",    # present / not found (biological presence)
         "pres/nft",   # variant spelling
-        "garber c",   # Garber colour class      (ordinal, not continuous)
+        "garber c",   # Garber colour class (ordinal, not continuous)
         "hh.mm",      # clock-time notation
-        "ngr",        # National Grid Reference  (a spatial code, not a number)
-        "deccafix",   # Decca navigation fix     (obsolete positioning)
+        "ngr",        # National Grid Reference (spatial code, not a number)
+        "deccafix",   # Decca navigation fix (obsolete positioning)
+        "ug",         # bare micrograms — mass with no volume denominator.
+                      #   685 records, mostly PAH recovery tests.
+                      #   Meaningless for water-quality concentration analysis.
     }
 
     # ==================================================================
     #  CONFIGURATION — NON-QUANTITATIVE TEST FRAGMENTS TO DROP
     # ==================================================================
-    # If a test name *contains* any of these fragments it is removed.
-    # These are categorical observations, not measurements.
+    # We use re.escape() on each fragment so that special characters
+    # like  (  )  /  are treated literally, not as regex operators.
+    # This also prevents pandas UserWarning about regex capture groups.
     # ------------------------------------------------------------------
 
     BAD_TEST_FRAGMENTS = [
-        "No flow",
-        "No sample",
-        "Site Inspection",
-        "Present/Not found",
-        "Pass/Fail",
-        "Population Equivalent",
-        "Sampling Frequency",
+        "No flow", "No sample", "Site Inspection",
+        "Present/Not found", "Pass/Fail",
+        "Population Equivalent", "Sampling Frequency",
         "Photo Taken",
-        "Weather :",          # weather flags (categorical)
+        "Weather :",
         "Bathing Water Profile",
         "National Grid Reference",
-        "Sewage debris",
-        "Foam Visible",
-        "Colour : Abnormal",
-        "Tarry residues",
-        "MST Filtration",
-        "Time of high tide",
-        "Number of beach users",
-        "Bathers per 100",
-        "Type of flow",
-        "Laboratory Sample Number",
-        "State tide",
-        "Colour (1/0)",
-        "Tars/Floatg",
-        "OilTypeQual",
-        "WEATHER FLAG",
-        "Borehole RefPt",
-        "Sample Depth",
+        "Sewage debris", "Foam Visible",
+        "Colour : Abnormal", "Tarry residues",
+        "MST Filtration", "Time of high tide",
+        "Number of beach users", "Bathers per 100",
+        "Type of flow", "Laboratory Sample Number",
+        "State tide", "Colour (1/0)", "Tars/Floatg",
+        "OilTypeQual", "WEATHER FLAG",
+        "Borehole RefPt", "Sample Depth",
     ]
+
+    _BAD_TEST_PATTERN = "|".join(re.escape(f) for f in BAD_TEST_FRAGMENTS)
 
     # ==================================================================
     #  CONFIGURATION — DUMMY / WRONG COORDINATES
     # ==================================================================
-    # The EA used placeholder coordinate pairs for mis-registered samples.
-    # These fall in the North Sea and must be removed so that spatial
-    # analyses are not biased.  The dummy sites are:
-    #   Easting = 500 000,  Northing = 1, 2, 3, 4, 5, 6, 7, or 8
-    # They were labelled things like "DUMMY SITE NO1 FOR GROUNDWATER
-    # SAMPLES, SAMPLES REGISTERED INCORRECTLY".
-    # ------------------------------------------------------------------
 
     DUMMY_EASTING  = 500_000
     DUMMY_NORTHINGS = {1, 2, 3, 4, 5, 6, 7, 8}
@@ -410,31 +400,32 @@ def build_ea_clean_2000_2025(
     # ==================================================================
     #  CONFIGURATION — OUTLIER THRESHOLDS
     # ==================================================================
-    # Physically plausible ranges for key parameters.  Values outside
-    # these ranges are FLAGGED (outlier_flag = True) but NOT removed.
-    # The user can filter them out later if they wish.
+    # Values outside these ranges are FLAGGED but NOT removed.
     #
-    # IMPORTANT NOTE ON NEGATIVE TEMPERATURES:
-    # Water in UK rivers and lakes can reach temperatures very close to
-    # 0 °C in winter and, under certain conditions (super-cooling near
-    # ice formation, instrument calibration drift), readings just below
-    # 0 °C have been recorded.  Rather than silently deleting these
-    # values (which discards potentially valid extreme-cold events), we
-    # FLAG them as outliers and let the user decide.  This is more
-    # transparent and reproducible than blanket removal.
+    # RATIONALE FOR NOT DELETING OUTLIERS:
+    #   Silently deleting records is irreversible and hides potentially
+    #   real extreme events (e.g. pollution spills, instrument faults).
+    #   Flagging is transparent: every record stays in the dataset and
+    #   the flag column lets the user decide what to include.
+    #
+    # NOTE ON NEGATIVE TEMPERATURES:
+    #   Water in UK rivers can reach temperatures very close to 0 °C in
+    #   winter.  Readings slightly below 0 °C can occur from super-
+    #   cooling near ice formation or minor instrument calibration drift.
+    #   We flag these but do NOT delete them.
     # ------------------------------------------------------------------
 
     OUTLIER_THRESHOLDS = {
-        "Temperature of Water":        (-5,    45),     # °C — allows slight sub-zero
-        "pH":                          ( 1,    14),     # pH units
-        "Conductivity at 25 C":        ( 0, 80_000),   # µS/cm
-        "Conductivity at 20 C":        ( 0, 80_000),   # µS/cm
-        "Salinity : In Situ":          ( 0,    50),     # ppt
-        "Solids, Suspended at 105 C":  ( 0, 50_000),   # mg/l
-        "Oxygen, Dissolved, % Saturation": (0, 250),    # %
-        "Oxygen, Dissolved as O2":     ( 0,    25),     # mg/l
-        "Ammoniacal Nitrogen as N":    ( 0, 1_000),     # mg/l
-        "Turbidity":                   ( 0, 10_000),    # NTU
+        "Temperature of Water":        (-5,    45),
+        "pH":                          ( 1,    14),
+        "Conductivity at 25 C":        ( 0, 80_000),
+        "Conductivity at 20 C":        ( 0, 80_000),
+        "Salinity : In Situ":          ( 0,    50),
+        "Solids, Suspended at 105 C":  ( 0, 50_000),
+        "Oxygen, Dissolved, % Saturation": (0, 250),
+        "Oxygen, Dissolved as O2":     ( 0,    25),
+        "Ammoniacal Nitrogen as N":    ( 0, 1_000),
+        "Turbidity":                   ( 0, 10_000),
     }
 
     # ==================================================================
@@ -461,15 +452,18 @@ def build_ea_clean_2000_2025(
         Convert all measurement units to a consistent set.
 
         Conversions applied:
-          µg/l  → mg/l   (÷ 1 000)
-          g/l   → mg/l   (× 1 000)
-          ppm   → mg/l   (equivalent for dilute aqueous solutions)
-          FTU   → NTU    (1 : 1  — both are nephelometric turbidity)
-          ms/cm → µS/cm  (× 1 000)
-          Various µS/cm spellings  → uS/cm
-
-        All comparisons are case-insensitive to handle inconsistent
-        capitalisation in the raw data.
+          µg/l   → mg/l     (÷ 1,000)
+          ng/l   → mg/l     (÷ 1,000,000)
+          pg/l   → mg/l     (÷ 1,000,000,000)
+          g/l    → mg/l     (× 1,000)
+          ppm    → mg/l     (1 : 1 for dilute aqueous solutions)
+          FTU    → NTU      (1 : 1 — both are nephelometric turbidity)
+          ms/cm  → uS/cm   (× 1,000)
+          no/ml  → no/100ml (× 100)
+          no/ul  → no/100ml (× 100,000)
+          no/10ul→ no/100ml (× 10,000)
+          g/kg   → ppt      (1 : 1 for salinity)
+          psu, ‰ → ppt      (1 : 1 by definition)
         """
         if "Test" not in df.columns or "Unit" not in df.columns:
             return df
@@ -477,8 +471,8 @@ def build_ea_clean_2000_2025(
         u = df["Unit"].astype(str).str.strip()
 
         # --- Conductivity unit spelling variants → uS/cm ---------------
-        u = (u.str.replace("µ",  "u", regex=False)
-              .str.replace("μ",  "u", regex=False)
+        u = (u.str.replace("µ", "u", regex=False)
+              .str.replace("μ", "u", regex=False)
               .str.replace("US/CM", "uS/cm", regex=False)
               .str.replace("Us/cm", "uS/cm", regex=False)
               .str.replace("us/cm", "uS/cm", regex=False)
@@ -491,52 +485,95 @@ def build_ea_clean_2000_2025(
             "Conductivity at 20C", "Conductivity at 20 C", regex=False
         )
 
-        # --- µg/l  →  mg/l  (÷ 1 000) ---------------------------------
-        mask_ug = df["Unit"].str.lower() == "ug/l"
-        if mask_ug.any():
-            df.loc[mask_ug, "result"] = (
-                pd.to_numeric(df.loc[mask_ug, "result"], errors="coerce") / 1_000
+        # --- µg/l  →  mg/l  (÷ 1,000) ---------------------------------
+        mask = df["Unit"].str.lower() == "ug/l"
+        if mask.any():
+            df.loc[mask, "result"] = (
+                pd.to_numeric(df.loc[mask, "result"], errors="coerce") / 1_000
             )
-            df.loc[mask_ug, "Unit"] = "mg/l"
+            df.loc[mask, "Unit"] = "mg/l"
 
-        # --- g/l  →  mg/l  (× 1 000) ----------------------------------
-        mask_gl = df["Unit"].str.lower() == "g/l"
-        if mask_gl.any():
-            df.loc[mask_gl, "result"] = (
-                pd.to_numeric(df.loc[mask_gl, "result"], errors="coerce") * 1_000
+        # --- ng/l  →  mg/l  (÷ 1,000,000) ------------------------------
+        mask = df["Unit"].str.lower() == "ng/l"
+        if mask.any():
+            df.loc[mask, "result"] = (
+                pd.to_numeric(df.loc[mask, "result"], errors="coerce") / 1_000_000
             )
-            df.loc[mask_gl, "Unit"] = "mg/l"
+            df.loc[mask, "Unit"] = "mg/l"
+
+        # --- pg/l  →  mg/l  (÷ 1,000,000,000) --------------------------
+        mask = df["Unit"].str.lower() == "pg/l"
+        if mask.any():
+            df.loc[mask, "result"] = (
+                pd.to_numeric(df.loc[mask, "result"], errors="coerce") / 1_000_000_000
+            )
+            df.loc[mask, "Unit"] = "mg/l"
+
+        # --- g/l  →  mg/l  (× 1,000) ----------------------------------
+        mask = df["Unit"].str.lower() == "g/l"
+        if mask.any():
+            df.loc[mask, "result"] = (
+                pd.to_numeric(df.loc[mask, "result"], errors="coerce") * 1_000
+            )
+            df.loc[mask, "Unit"] = "mg/l"
 
         # --- ppm  →  mg/l  (1 : 1 in dilute water) --------------------
-        mask_ppm = df["Unit"].str.lower() == "ppm"
-        if mask_ppm.any():
-            df.loc[mask_ppm, "Unit"] = "mg/l"
+        mask = df["Unit"].str.lower() == "ppm"
+        if mask.any():
+            df.loc[mask, "Unit"] = "mg/l"
 
-        # --- FTU  →  NTU  (1 : 1) -------------------------------------
-        mask_ftu = (df["Test"] == "Turbidity") & (df["Unit"].str.lower() == "ftu")
-        if mask_ftu.any():
-            df.loc[mask_ftu, "Unit"] = "NTU"
+        # --- FTU  →  NTU  (1 : 1, applied to ALL tests) ---------------
+        #     Previously only caught Test == "Turbidity" exactly.
+        #     "Turbidity : In Situ" (48,912 records) also uses FTU.
+        #     FTU and NTU are both nephelometric scales and are
+        #     numerically identical, so we convert regardless of test.
+        mask = df["Unit"].str.lower() == "ftu"
+        if mask.any():
+            df.loc[mask, "Unit"] = "NTU"
 
-        # --- ntu  →  NTU  (capitalisation) -----------------------------
-        mask_ntu = df["Unit"].str.lower() == "ntu"
-        if mask_ntu.any():
-            df.loc[mask_ntu, "Unit"] = "NTU"
+        # --- ntu (lowercase) → NTU (capitalisation only) ---------------
+        mask = df["Unit"] == "ntu"
+        if mask.any():
+            df.loc[mask, "Unit"] = "NTU"
 
-        # --- ms/cm  →  uS/cm  (× 1 000) -------------------------------
-        mask_ms = df["Unit"].str.lower() == "ms/cm"
-        if mask_ms.any():
-            df.loc[mask_ms, "result"] = (
-                pd.to_numeric(df.loc[mask_ms, "result"], errors="coerce") * 1_000
+        # --- ms/cm  →  uS/cm  (× 1,000) -------------------------------
+        mask = df["Unit"].str.lower() == "ms/cm"
+        if mask.any():
+            df.loc[mask, "result"] = (
+                pd.to_numeric(df.loc[mask, "result"], errors="coerce") * 1_000
             )
-            df.loc[mask_ms, "Unit"] = "uS/cm"
+            df.loc[mask, "Unit"] = "uS/cm"
 
-        # --- Salinity variants → ppt ----------------------------------
-        mask_sal = (
-            (df["Test"] == "Salinity : In Situ")
-            & df["Unit"].str.lower().isin(["g/l", "psu", "‰"])
-        )
-        if mask_sal.any():
-            df.loc[mask_sal, "Unit"] = "ppt"
+        # --- MICROBIOLOGY: no/ml → no/100ml (× 100) -------------------
+        #     The EA used both no/ml and no/100ml for coliform and
+        #     streptococcal tests.  no/100ml is the regulatory standard.
+        mask = df["Unit"] == "no/ml"
+        if mask.any():
+            df.loc[mask, "result"] = (
+                pd.to_numeric(df.loc[mask, "result"], errors="coerce") * 100
+            )
+            df.loc[mask, "Unit"] = "no/100ml"
+
+        # --- no/ul → no/100ml (× 100,000) -----------------------------
+        mask = df["Unit"] == "no/ul"
+        if mask.any():
+            df.loc[mask, "result"] = (
+                pd.to_numeric(df.loc[mask, "result"], errors="coerce") * 100_000
+            )
+            df.loc[mask, "Unit"] = "no/100ml"
+
+        # --- no/10ul → no/100ml (× 10,000) ----------------------------
+        mask = df["Unit"] == "no/10ul"
+        if mask.any():
+            df.loc[mask, "result"] = (
+                pd.to_numeric(df.loc[mask, "result"], errors="coerce") * 10_000
+            )
+            df.loc[mask, "Unit"] = "no/100ml"
+
+        # --- SALINITY: g/kg, psu, ‰ → ppt (all 1 : 1) ----------------
+        mask = df["Unit"].str.lower().isin({"g/kg", "psu", "\u2030"})
+        if mask.any():
+            df.loc[mask, "Unit"] = "ppt"
 
         return df
 
@@ -545,10 +582,7 @@ def build_ea_clean_2000_2025(
     # ==================================================================
 
     def _flag_outliers(df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Add an  outlier_flag  column.  Values outside physically
-        plausible thresholds are set to True.  Nothing is deleted.
-        """
+        """Add outlier_flag column. Nothing is deleted."""
         if "outlier_flag" not in df.columns:
             df["outlier_flag"] = False
 
@@ -565,14 +599,7 @@ def build_ea_clean_2000_2025(
     # ==================================================================
 
     def _convert_coordinates(df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Replace  Easting / Northing  (British National Grid, EPSG:27700)
-        with  Latitude / Longitude  (WGS-84, EPSG:4326).
-
-        To avoid doing millions of slow per-row conversions, we first
-        extract the unique coordinate pairs, convert them once, then
-        merge the results back.  This is much faster.
-        """
+        """Replace Easting/Northing (EPSG:27700) with Lat/Lon (EPSG:4326)."""
         if "Easting" not in df.columns or "Northing" not in df.columns:
             return df
 
@@ -597,8 +624,6 @@ def build_ea_clean_2000_2025(
 
         n_before = len(df)
         df = df.merge(unique, on=["Easting", "Northing"], how="left")
-
-        # Drop the original Easting / Northing columns
         df = df.drop(columns=["Easting", "Northing"])
 
         log(f"    {len(unique):,} unique coordinate pairs converted.")
@@ -608,7 +633,7 @@ def build_ea_clean_2000_2025(
         return df
 
     # ==================================================================
-    #  CHUNK CLEANER  (processes one chunk from one yearly CSV)
+    #  CHUNK CLEANER
     # ==================================================================
 
     def _clean_chunk(
@@ -616,25 +641,15 @@ def build_ea_clean_2000_2025(
         year_hint: int,
         test_filter: Optional[set],
     ) -> pd.DataFrame:
-        """
-        Apply all cleaning rules to a single chunk of raw data.
-
-        Parameters
-        ----------
-        raw         : one chunk read from pd.read_csv
-        year_hint   : the year of the source file (used if Date is missing)
-        test_filter : set of test names to keep, or None to keep all
-        """
         df = raw.copy()
 
         # --- Drop unneeded columns ------------------------------------
         drop_cols = [
-            "@id",
-            "sample.samplingPoint",
+            "@id", "sample.samplingPoint",
             "sample.samplingPoint.notation",
             "resultQualifier.notation",
             "codedResultInterpretation.interpretation",
-            "determinand.label",            # we use .definition instead
+            "determinand.label",
             "sample.isComplianceSample",
             "sample.purpose.label",
             "determinand.notation",
@@ -643,7 +658,7 @@ def build_ea_clean_2000_2025(
         if existing:
             df = df.drop(columns=existing)
 
-        # --- Rename columns to short names ----------------------------
+        # --- Rename columns -------------------------------------------
         rename_map = {
             "sample.samplingPoint.label":       "Sampling Point",
             "sample.sampleDateTime":            "Date",
@@ -687,13 +702,10 @@ def build_ea_clean_2000_2025(
 
         # --- Filter by sample type ------------------------------------
         if "Type" in df.columns:
-            # First exclude anything matching the drop pattern
             df = df[
-                ~df["Type"]
-                .astype(str)
+                ~df["Type"].astype(str)
                 .str.contains(DROP_TYPE_PATTERN, case=False, na=False)
             ]
-            # Then keep only recognised water types
             df = df[df["Type"].isin(WATER_TYPES)]
 
         # --- Remove non-quantitative units ----------------------------
@@ -702,9 +714,9 @@ def build_ea_clean_2000_2025(
 
         # --- Remove non-quantitative test fragments -------------------
         if "Test" in df.columns:
-            pattern = "|".join(BAD_TEST_FRAGMENTS)
             bad_test_mask = (
-                df["Test"].astype(str).str.contains(pattern, case=False, na=False)
+                df["Test"].astype(str)
+                .str.contains(_BAD_TEST_PATTERN, case=False, na=False)
             )
             df = df[~bad_test_mask]
 
@@ -724,11 +736,11 @@ def build_ea_clean_2000_2025(
         if "result" in df.columns:
             df = df[df["result"].notna()]
 
-        # --- Flag outliers (if requested) -----------------------------
+        # --- Flag outliers -------------------------------------------
         if flag_outliers:
             df = _flag_outliers(df)
 
-        # --- Arrange columns in a readable order ----------------------
+        # --- Arrange columns -----------------------------------------
         col_order = [
             "Sampling Point", "Type", "Date", "Test", "result", "Unit",
             "Season", "SourceYear", "Easting", "Northing",
@@ -751,7 +763,6 @@ def build_ea_clean_2000_2025(
         if p.exists():
             year_files.append((y, p))
         else:
-            # Try patterns like  2000_data.csv  etc.
             matches = sorted(input_dir.glob(f"{y}*.csv"))
             if matches:
                 year_files.append((y, matches[0]))
@@ -768,7 +779,7 @@ def build_ea_clean_2000_2025(
     log()
 
     # ==================================================================
-    #  DETERMINE WHICH TESTS TO KEEP  (mode-dependent)
+    #  DETERMINE WHICH TESTS TO KEEP
     # ==================================================================
 
     if mode == "electrochemistry":
@@ -776,15 +787,19 @@ def build_ea_clean_2000_2025(
         log(f"Mode = ELECTROCHEMISTRY  →  keeping {len(test_filter)} "
             f"pre-defined tests.\n")
     else:
-        # In "full" mode we keep every test that has at least
-        # min_test_count records.  We do a quick first pass to count.
         if min_test_count > 0:
             log(f"Mode = FULL  →  first pass: counting tests to drop "
                 f"those with < {min_test_count} total records …")
             test_counts: Dict[str, int] = {}
             for y, csv_path in year_files:
+                try:
+                    enc = "utf-8"
+                    pd.read_csv(csv_path, nrows=2, encoding="utf-8")
+                except UnicodeDecodeError:
+                    enc = "latin-1"
                 for chunk in pd.read_csv(
                     csv_path, chunksize=chunksize, low_memory=False,
+                    encoding=enc,
                     usecols=lambda c: c in (
                         "determinand.definition", "determinand.unit.label"
                     ),
@@ -804,14 +819,13 @@ def build_ea_clean_2000_2025(
             log(f"  Rare tests dropped       : {dropped_tests:,}")
             log()
         else:
-            test_filter = None  # keep everything
+            test_filter = None
             log("Mode = FULL, min_test_count = 0  →  keeping ALL tests.\n")
 
     # ==================================================================
-    #  MAIN PROCESSING LOOP  (stream chunks, clean, write to temp CSV)
+    #  MAIN PROCESSING LOOP
     # ==================================================================
 
-    # Output paths
     tag = "electrochemistry" if mode == "electrochemistry" else "full"
     out_csv  = out_dir / f"EA_clean_2000_2025_{tag}.csv"
     out_pq   = out_dir / f"EA_clean_2000_2025_{tag}.parquet"
@@ -820,29 +834,22 @@ def build_ea_clean_2000_2025(
     out_log  = out_dir / f"EA_processing_log_{tag}.txt"
     tmp_csv  = out_dir / "_tmp_stream.csv"
 
-    # Clean slate
     for p in (out_csv, out_pq, tmp_csv):
         if p.exists():
             p.unlink()
 
     summary: Dict[int, int] = {}
-    total_streamed    = 0
-    header_written    = False
-    total_raw         = 0
-    total_type_dropped = 0
-    total_unit_dropped = 0
-    total_test_dropped = 0
-    total_dummy_dropped = 0
+    total_streamed = 0
+    header_written = False
+    total_raw      = 0
 
     for y, csv_path in year_files:
         log(f"── Processing {y}  ({csv_path.name}) " + "─" * 30)
 
         n_year_clean = 0
         n_year_raw   = 0
-        n_chunks     = 0
 
         enc = None
-        # Auto-detect encoding if needed
         try:
             pd.read_csv(csv_path, nrows=5, encoding="utf-8")
             enc = "utf-8"
@@ -858,17 +865,10 @@ def build_ea_clean_2000_2025(
         for chunk in pd.read_csv(
             csv_path, chunksize=chunksize, low_memory=False, encoding=enc
         ):
-            raw_rows = len(chunk)
-            n_year_raw += raw_rows
-            total_raw  += raw_rows
-
-            # Count what we drop for reporting
-            pre_type = len(chunk)
-            # We cannot count exactly per-category in streaming mode
-            # without duplicating logic, so we count the net result.
+            n_year_raw += len(chunk)
+            total_raw  += len(chunk)
 
             cleaned = _clean_chunk(chunk, year_hint=y, test_filter=test_filter)
-            clean_rows = len(cleaned)
 
             if not cleaned.empty:
                 cleaned.to_csv(
@@ -876,10 +876,8 @@ def build_ea_clean_2000_2025(
                     header=(not header_written)
                 )
                 header_written = True
-                n_year_clean  += clean_rows
-                total_streamed += clean_rows
-
-            n_chunks += 1
+                n_year_clean  += len(cleaned)
+                total_streamed += len(cleaned)
 
         dropped_year = n_year_raw - n_year_clean
         pct = (n_year_clean / n_year_raw * 100) if n_year_raw else 0
@@ -904,14 +902,13 @@ def build_ea_clean_2000_2025(
         )
 
     # ==================================================================
-    #  FINAL PROCESSING  (dedup, coordinate conversion, save)
+    #  FINAL PROCESSING
     # ==================================================================
 
     log("Loading streamed data for final processing …")
     df_all = pd.read_csv(tmp_csv, low_memory=False, parse_dates=["Date"])
     log(f"  Rows loaded: {len(df_all):,}")
 
-    # --- Final type safety net ----------------------------------------
     if "Type" in df_all.columns:
         mask = (
             df_all["Type"].isin(WATER_TYPES)
@@ -924,26 +921,22 @@ def build_ea_clean_2000_2025(
         if n_extra:
             log(f"  Extra type filter removed {n_extra:,} rows.")
 
-    # --- Drop exact duplicates ----------------------------------------
     key_cols = ["Date", "Sampling Point", "Type", "Test"]
     d0 = len(df_all)
     df_all = df_all.drop_duplicates(subset=key_cols, keep="first")
     n_dupes = d0 - len(df_all)
     log(f"  Duplicates removed: {n_dupes:,}")
 
-    # --- Ensure result is numeric and non-null ------------------------
     df_all["result"] = pd.to_numeric(df_all["result"], errors="coerce")
     n_nan = df_all["result"].isna().sum()
     df_all = df_all[df_all["result"].notna()]
     if n_nan:
         log(f"  NaN results dropped: {n_nan:,}")
 
-    # --- Season dtype -------------------------------------------------
     df_all["Season"] = pd.Categorical(
         df_all["Season"], categories=SEASON_CATS, ordered=True
     )
 
-    # --- Convert coordinates ------------------------------------------
     df_final = _convert_coordinates(df_all)
 
     log(f"\n  Final dataset: {len(df_final):,} rows × "
@@ -951,6 +944,7 @@ def build_ea_clean_2000_2025(
     log(f"  Unique sampling points : {df_final['Sampling Point'].nunique():,}")
     log(f"  Unique tests           : {df_final['Test'].nunique()}")
     log(f"  Unique water types     : {df_final['Type'].nunique()}")
+    log(f"  Unique units           : {df_final['Unit'].nunique()}")
     log(f"  Date range             : {df_final['Date'].min()} → "
         f"{df_final['Date'].max()}")
     log()
@@ -972,7 +966,7 @@ def build_ea_clean_2000_2025(
         log(f"  ⚠  Parquet skipped: {e}")
 
     # ==================================================================
-    #  STATISTICAL SUMMARY  (optional)
+    #  STATISTICAL SUMMARY
     # ==================================================================
 
     stats_output = None
@@ -981,7 +975,6 @@ def build_ea_clean_2000_2025(
         try:
             with pd.ExcelWriter(out_stats, engine="openpyxl") as writer:
 
-                # Sheet 1 — descriptive stats per test
                 test_stats = (
                     df_final.groupby(["Test", "Unit"])["result"]
                     .agg([
@@ -994,49 +987,37 @@ def build_ea_clean_2000_2025(
                     .round(4)
                     .reset_index()
                 )
-                test_stats.to_excel(
-                    writer, sheet_name="Test_Statistics", index=False
-                )
+                test_stats.to_excel(writer, sheet_name="Test_Statistics", index=False)
 
-                # Sheet 2 — stats per type × test
                 type_stats = (
                     df_final.groupby(["Type", "Test"])["result"]
                     .agg(["count", "mean", "median", "std"])
                     .round(4)
                     .reset_index()
                 )
-                type_stats.to_excel(
-                    writer, sheet_name="Type_Test_Stats", index=False
-                )
+                type_stats.to_excel(writer, sheet_name="Type_Test_Stats", index=False)
 
-                # Sheet 3 — seasonal stats
                 season_stats = (
                     df_final.groupby(["Season", "Test"])["result"]
                     .agg(["count", "mean", "median"])
                     .round(4)
                     .reset_index()
                 )
-                season_stats.to_excel(
-                    writer, sheet_name="Seasonal_Stats", index=False
-                )
+                season_stats.to_excel(writer, sheet_name="Seasonal_Stats", index=False)
 
-                # Sheet 4 — coverage summary
                 coverage = pd.DataFrame({
                     "Metric": [
-                        "Total Rows",
-                        "Unique Sampling Points",
-                        "Unique Tests",
-                        "Unique Types",
-                        "Date Range Start",
-                        "Date Range End",
-                        "Years Covered",
-                        "Mode",
+                        "Total Rows", "Unique Sampling Points",
+                        "Unique Tests", "Unique Types", "Unique Units",
+                        "Date Range Start", "Date Range End",
+                        "Years Covered", "Mode",
                     ],
                     "Value": [
                         len(df_final),
                         df_final["Sampling Point"].nunique(),
                         df_final["Test"].nunique(),
                         df_final["Type"].nunique(),
+                        df_final["Unit"].nunique(),
                         str(df_final["Date"].min().date()),
                         str(df_final["Date"].max().date()),
                         df_final["SourceYear"].nunique(),
@@ -1045,32 +1026,34 @@ def build_ea_clean_2000_2025(
                 })
                 coverage.to_excel(writer, sheet_name="Coverage", index=False)
 
-                # Sheet 5 — outlier summary (if flagging is on)
                 if flag_outliers and "outlier_flag" in df_final.columns:
                     outlier_df = df_final[df_final["outlier_flag"]]
                     if not outlier_df.empty:
                         outlier_summary = (
                             outlier_df.groupby(["Test", "Type"])
-                            .agg(
-                                count=("result", "size"),
-                                min_val=("result", "min"),
-                                max_val=("result", "max"),
-                            )
+                            .agg(count=("result", "size"),
+                                 min_val=("result", "min"),
+                                 max_val=("result", "max"))
                             .reset_index()
                         )
-                        outlier_summary.to_excel(
-                            writer, sheet_name="Outliers", index=False
-                        )
+                        outlier_summary.to_excel(writer, sheet_name="Outliers", index=False)
 
-                # Sheet 6 — rows per year
                 year_counts = (
-                    df_final.groupby("SourceYear")
-                    .size()
+                    df_final.groupby("SourceYear").size()
                     .reset_index(name="rows")
                 )
-                year_counts.to_excel(
-                    writer, sheet_name="Rows_Per_Year", index=False
+                year_counts.to_excel(writer, sheet_name="Rows_Per_Year", index=False)
+
+                unit_check = (
+                    df_final.groupby("Test")["Unit"]
+                    .apply(lambda x: ", ".join(sorted(x.unique())))
+                    .reset_index().rename(columns={"Unit": "Units"})
                 )
+                unit_check["n_units"] = unit_check["Units"].str.count(",") + 1
+                multi_unit = unit_check[unit_check["n_units"] > 1].sort_values(
+                    "n_units", ascending=False
+                )
+                multi_unit.to_excel(writer, sheet_name="Multi_Unit_Tests", index=False)
 
             stats_output = out_stats
             log(f"  ✓  Statistics saved : {out_stats.name}")
@@ -1078,56 +1061,43 @@ def build_ea_clean_2000_2025(
             log(f"  ⚠  Statistics failed: {e}")
 
     # ==================================================================
-    #  QA REPORT  (optional)
+    #  QA REPORT
     # ==================================================================
 
     qa_output = None
     if generate_qa_report:
         log("\nGenerating QA report …")
         try:
-            # Build the HTML report
             n_outliers = 0
             pct_outliers = 0
             if flag_outliers and "outlier_flag" in df_final.columns:
                 n_outliers = int(df_final["outlier_flag"].sum())
                 pct_outliers = (n_outliers / len(df_final)) * 100
 
-            # Top 15 types
             type_rows = ""
             for typ, cnt in df_final["Type"].value_counts().head(15).items():
                 pct = cnt / len(df_final) * 100
-                type_rows += (
-                    f"<tr><td>{typ}</td><td>{cnt:,}</td>"
-                    f"<td>{pct:.1f}%</td></tr>\n"
-                )
+                type_rows += f"<tr><td>{typ}</td><td>{cnt:,}</td><td>{pct:.1f}%</td></tr>\n"
 
-            # Top 20 tests
             test_rows = ""
             for tst, cnt in df_final["Test"].value_counts().head(20).items():
                 pct = cnt / len(df_final) * 100
-                test_rows += (
-                    f"<tr><td>{tst}</td><td>{cnt:,}</td>"
-                    f"<td>{pct:.1f}%</td></tr>\n"
-                )
+                test_rows += f"<tr><td>{tst}</td><td>{cnt:,}</td><td>{pct:.1f}%</td></tr>\n"
 
-            # Unit consistency
+            unit_dist_rows = ""
+            for u_name, cnt in df_final["Unit"].value_counts().head(25).items():
+                pct = cnt / len(df_final) * 100
+                unit_dist_rows += f"<tr><td>{u_name}</td><td>{cnt:,}</td><td>{pct:.1f}%</td></tr>\n"
+
             unit_rows = ""
             unit_per_test = df_final.groupby("Test")["Unit"].nunique()
             multi = unit_per_test[unit_per_test > 1]
             if len(multi) == 0:
-                unit_rows = (
-                    "<tr><td colspan='3'>✓ All tests have a single "
-                    "consistent unit</td></tr>"
-                )
+                unit_rows = "<tr><td colspan='3'>✓ All tests have a single consistent unit</td></tr>"
             else:
                 for tst, n_u in multi.items():
-                    units = ", ".join(
-                        df_final[df_final["Test"] == tst]["Unit"].unique()
-                    )
-                    unit_rows += (
-                        f"<tr class='warn'><td>{tst}</td>"
-                        f"<td>{units}</td><td>⚠ {n_u} units</td></tr>\n"
-                    )
+                    units = ", ".join(df_final[df_final["Test"] == tst]["Unit"].unique())
+                    unit_rows += f"<tr class='warn'><td>{tst}</td><td>{units}</td><td>⚠ {n_u} units</td></tr>\n"
 
             qa_html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -1160,6 +1130,7 @@ def build_ea_clean_2000_2025(
 <tr><td>Unique sampling points</td><td>{df_final['Sampling Point'].nunique():,}</td></tr>
 <tr><td>Unique tests</td><td>{df_final['Test'].nunique()}</td></tr>
 <tr><td>Unique water types</td><td>{df_final['Type'].nunique()}</td></tr>
+<tr><td>Unique units</td><td>{df_final['Unit'].nunique()}</td></tr>
 <tr><td>Date range</td><td>{df_final['Date'].min().date()} → {df_final['Date'].max().date()}</td></tr>
 <tr><td>Years covered</td><td>{df_final['SourceYear'].min()} – {df_final['SourceYear'].max()}</td></tr>
 <tr><td>Records with coordinates</td><td>{df_final['Latitude'].notna().sum():,} ({df_final['Latitude'].notna().mean()*100:.1f}%)</td></tr>
@@ -1176,6 +1147,22 @@ def build_ea_clean_2000_2025(
     <td class="{'good' if pct_outliers < 5 else 'bad'}">{'✓ OK' if pct_outliers < 5 else '⚠ CHECK'}</td></tr>
 </table>
 
+<h2>Unit Conversions Applied</h2>
+<table>
+<tr><th>From</th><th>To</th><th>Factor</th><th>Rationale</th></tr>
+<tr><td>µg/l</td><td>mg/l</td><td>÷ 1,000</td><td>Standard mass-concentration scale</td></tr>
+<tr><td>ng/l</td><td>mg/l</td><td>÷ 1,000,000</td><td>Standard mass-concentration scale</td></tr>
+<tr><td>pg/l</td><td>mg/l</td><td>÷ 1,000,000,000</td><td>Standard mass-concentration scale</td></tr>
+<tr><td>g/l</td><td>mg/l</td><td>× 1,000</td><td>Standard mass-concentration scale</td></tr>
+<tr><td>ppm</td><td>mg/l</td><td>1 : 1</td><td>Equivalent for dilute aqueous solutions</td></tr>
+<tr><td>FTU</td><td>NTU</td><td>1 : 1</td><td>Both nephelometric turbidity scales</td></tr>
+<tr><td>ms/cm</td><td>uS/cm</td><td>× 1,000</td><td>Standard conductivity scale</td></tr>
+<tr><td>no/ml</td><td>no/100ml</td><td>× 100</td><td>Regulatory standard for microbiology</td></tr>
+<tr><td>no/ul</td><td>no/100ml</td><td>× 100,000</td><td>Regulatory standard for microbiology</td></tr>
+<tr><td>no/10ul</td><td>no/100ml</td><td>× 10,000</td><td>Regulatory standard for microbiology</td></tr>
+<tr><td>g/kg, psu, ‰</td><td>ppt</td><td>1 : 1</td><td>All equivalent salinity measures</td></tr>
+</table>
+
 <h2>Top Water Types by Volume</h2>
 <table>
 <tr><th>Type</th><th>Rows</th><th>%</th></tr>
@@ -1188,14 +1175,24 @@ def build_ea_clean_2000_2025(
 {test_rows}
 </table>
 
-<h2>Unit Consistency</h2>
+<h2>Top Units by Volume</h2>
+<table>
+<tr><th>Unit</th><th>Rows</th><th>%</th></tr>
+{unit_dist_rows}
+</table>
+
+<h2>Unit Consistency (tests with more than one unit)</h2>
+<p><i>Some tests legitimately use multiple units when measuring different
+properties (e.g. mg/l for water concentration vs mg/kg for leachable fraction,
+or % for dry-weight composition).  Review these to decide if further
+filtering is needed for your specific analysis.</i></p>
 <table>
 <tr><th>Test</th><th>Units found</th><th>Status</th></tr>
 {unit_rows}
 </table>
 
 <footer>
-<p>Report generated by EA Water Quality Data Processor v2.0<br>
+<p>Report generated by EA Water Quality Data Processor v2.1<br>
 Source data: Environment Agency (England) Open Water Quality Archive, 2000–2025</p>
 </footer>
 </body>
@@ -1210,7 +1207,7 @@ Source data: Environment Agency (England) Open Water Quality Archive, 2000–202
             log(f"  ⚠  QA report failed: {e}")
 
     # ==================================================================
-    #  CLEAN UP TEMP FILE
+    #  CLEAN UP
     # ==================================================================
 
     try:
@@ -1232,6 +1229,7 @@ Source data: Environment Agency (England) Open Water Quality Archive, 2000–202
         f"{df_final['SourceYear'].max()}")
     log(f"  Water types    : {df_final['Type'].nunique()}")
     log(f"  Tests          : {df_final['Test'].nunique()}")
+    log(f"  Units          : {df_final['Unit'].nunique()}")
     log(f"  Sampling points: {df_final['Sampling Point'].nunique():,}")
 
     if flag_outliers and "outlier_flag" in df_final.columns:
@@ -1271,10 +1269,6 @@ Source data: Environment Agency (England) Open Water Quality Archive, 2000–202
         log_path = out_log
         print(f"\n  ✓  Full log saved : {out_log.name}")
 
-    # ==================================================================
-    #  RETURN SUMMARY DICT
-    # ==================================================================
-
     return {
         "final_rows":    len(df_final),
         "per_year_rows": summary,
@@ -1290,6 +1284,7 @@ Source data: Environment Agency (England) Open Water Quality Archive, 2000–202
             "unique_sampling_points": df_final["Sampling Point"].nunique(),
             "unique_tests":          df_final["Test"].nunique(),
             "unique_types":          df_final["Type"].nunique(),
+            "unique_units":          df_final["Unit"].nunique(),
             "date_range": (
                 str(df_final["Date"].min()),
                 str(df_final["Date"].max()),
