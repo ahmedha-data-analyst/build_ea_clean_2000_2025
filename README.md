@@ -3,38 +3,51 @@
 **Title** : Environment Agency (England) Open Water Quality Archive — Processor
 **Version** : 2.1.0
 **Authors** : Domanique Bridglalsingh, Ahmed Abdalla, Jia Hu, Geyong Min, Xiaohong Li, and Siwei Zheng
+**Licence** : CC-BY-4.0 (same licence as the underlying EA data)
 **Python** : >= 3.9
 
-## WHAT THIS DOES
-The Environment Agency (EA) published annual CSV files of water-quality measurements from 2000 to 2025. This script takes those 26 massive, messy raw CSV files and automatically cleans them, fixes the coordinates, standardizes the measurement units, and combines them into one ready-to-use dataset. 
+## PURPOSE
+-------
+The Environment Agency (EA) published annual CSV files of water-quality measurements from 2000 to 2025. Those files are no longer publicly hosted. This script reads the raw yearly CSVs, applies transparent and reproducible cleaning steps, and produces a single, analysis-ready dataset.
 
-It even installs the required Python libraries for you automatically!
+## TWO OUTPUT MODES
+----------------
+1. **"full"** – Every water-related test, type, and sampling point.
+2. **"electrochemistry"** – A focused subset of dissolved metals, ions, pH, conductivity, temperature, and turbidity — the parameters most relevant to electrochemical sensing.
 
-## IDIOTPROOF QUICKSTART GUIDE
-Follow these exact steps to run the cleaner:
+## HOW TO USE
+--------------------------------------------------------
+1. Place all 26 raw CSV files (2000.csv … 2025.csv) in ONE folder.
+2. Open the main script in a Jupyter notebook or run it as a Python file.
+3. Set `RAW_DATA_FOLDER` to the path that contains your CSV files.
+4. Set `MODE` to "full" or "electrochemistry".
+5. Run the script. A new subfolder is created automatically with all outputs.
 
-**Step 1: Get the data ready**
-1. Create a new folder on your computer. Let's call it `EA_Raw_Data`.
-2. Put all 26 of your raw CSV files (`2000.csv` through `2025.csv`) into this `EA_Raw_Data` folder. Do not put them in sub-folders.
+## WHAT THE SCRIPT DOES (step by step)
+------------------------------------
+For every yearly CSV the script will:
+* Drop columns that are not needed (internal EA IDs, compliance flags …).
+* Rename columns to short, human-readable names.
+* Use the *definition* column (`determinand.definition`) for test names, because it is more descriptive than the abbreviated label.
+* Remove non-quantitative rows (unit = "coded", "text", "yes/no" …).
+* Remove tests that appear fewer than `MIN_TEST_COUNT` times across all 26 years (default 50 — less than 2 per year on average).
+* Remove sample types that are not water-related (biota, soil, gas …).
+* Standardise units (e.g., µg/l → mg/l, ms/cm → uS/cm, FTU → NTU).
+* Convert British National Grid (Easting / Northing) to WGS-84 Latitude / Longitude using the pyproj library.
+* Remove known dummy / placeholder coordinates that the EA used for mis-registered samples.
+* Flag (but NOT delete) potential outliers for key parameters.
+* Print a detailed log of every action so you can see exactly what happened at every step.
 
-**Step 2: Tell the script where your data is**
-1. Open the file named `run_processor.py` (or scroll to the very bottom of `ea_water_quality_processor.py`).
-2. Look for the line that says `RAW_DATA_FOLDER = "."`.
-3. Change `"."` to the exact path of the folder you created in Step 1. 
-   * *Example:* `RAW_DATA_FOLDER = "C:/Users/YourName/Desktop/EA_Raw_Data"`
+## OUTPUTS
+---------
+All outputs are automatically saved in `<RAW_DATA_FOLDER>/EA_processed_output/`:
+* **EA_clean_2000_2025.csv** – The main clean dataset.
+* **EA_clean_2000_2025.parquet** – Same data in fast columnar format.
+* **EA_statistics_2000_2025.xlsx** – Descriptive statistics.
+* **EA_qa_report.html** – Visual quality-assurance summary.
+* **processing_log.txt** – Full text log of every cleaning step.
 
-**Step 3: Choose your mode**
-Find the line that says `MODE = "full"`. Leave it as "full" to keep everything, or change it to `"electrochemistry"` if you only want data for dissolved metals, ions, pH, conductivity, temperature, and turbidity.
-
-**Step 4: Run it!**
-Open your terminal (or command prompt) and run the script:
-`python ea_water_quality_processor.py`
-
-Go grab a coffee. The script will print a detailed log showing you exactly what it is doing at every step. 
-
-## WHERE DOES MY CLEAN DATA GO?
-When the script finishes, it will automatically create a new folder inside your raw data folder called `EA_processed_output`. Inside, you will find:
-* **The clean data:** `EA_clean_2000_2025.csv` and a faster `.parquet` version.
-* **The stats:** `EA_statistics_2000_2025.xlsx` (Excel file with descriptive statistics).
-* **The health check:** `EA_qa_report.html` (Double-click this to open a visual report in your web browser).
-* **The receipt:** `processing_log.txt` (A text file showing everything the script did).
+## DEPENDENCIES
+-----------
+Dependencies are automatically installed if missing. The script requires:
+* `pandas`, `numpy`, `pyproj`, `pyarrow`, `openpyxl`, `chardet`.
