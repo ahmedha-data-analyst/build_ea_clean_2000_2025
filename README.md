@@ -9,7 +9,7 @@
 *Environment Agency (England) Open Water Quality Archive — Processor*
 
 **Authors:** Domanique Bridglalsingh, Ahmed Abdalla, Jia Hu, Geyong Min, Xiaohong Li, and Siwei Zheng 
-[cite_start]**Website:** [www.hydrostar-eu.com](http://www.hydrostar-eu.com) [cite: 68]
+**Website:** [www.hydrostar-eu.com](http://www.hydrostar-eu.com)
 
 ---
 
