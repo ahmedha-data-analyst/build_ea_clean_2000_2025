@@ -1,4 +1,4 @@
-<img src="logo.png" alt="HydroStar Logo" width="250">
+<img src="logo.png" alt="HydroStar Logo" width="150">
 
 # EA water quality data processor
 
